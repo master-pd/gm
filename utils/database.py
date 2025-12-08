@@ -1,26 +1,22 @@
-"""
-Database Operations for Telegram Bot
-"""
 
+import sqlite3
 import json
-import pickle
 import os
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
-import firebase_admin
-from firebase_admin import firestore
+import aiosqlite
+from pathlib import Path
 
 class Database:
-    """Database operations using Firebase Firestore"""
+    """SQLite Database operations"""
     
-    def __init__(self):
-        self.db = firestore.client()
+    def __init__(self, db_path="data/bot_database.db"):
+        self.db_path = db_path
         self.local_data_path = "data/local_data.json"
-        self.backup_path = "backups/"
         
-        # Initialize local storage
+        # Initialize directories
+        os.makedirs(os.path.dirname(self.db_path), exist_ok=True)
         os.makedirs(os.path.dirname(self.local_data_path), exist_ok=True)
-        os.makedirs(self.backup_path, exist_ok=True)
         
         self.local_data = self._load_local_data()
     
@@ -39,30 +35,71 @@ class Database:
         with open(self.local_data_path, 'w', encoding='utf-8') as f:
             json.dump(self.local_data, f, ensure_ascii=False, indent=2)
     
+    # ==================== SYNC OPERATIONS ====================
+    
+    def get_connection(self):
+        """Get SQLite connection"""
+        conn = sqlite3.connect(self.db_path)
+        conn.row_factory = sqlite3.Row
+        return conn
+    
     # ==================== USER OPERATIONS ====================
     
-    async def save_user(self, user_id: int, data: Dict):
-        """Save user data to Firebase and local"""
-        user_ref = self.db.collection('users').document(str(user_id))
-        
-        # Prepare data
-        user_data = {
-            **data,
-            'updated_at': firestore.SERVER_TIMESTAMP,
-            'last_seen': firestore.SERVER_TIMESTAMP
-        }
-        
-        # Save to Firebase
-        user_ref.set(user_data, merge=True)
-        
-        # Save to local cache
-        if 'users' not in self.local_data:
-            self.local_data['users'] = {}
-        
-        self.local_data['users'][str(user_id)] = user_data
-        self._save_local_data()
-        
-        return True
+    async def save_user(self, user_id: int, data: Dict) -> bool:
+        """Save user data to SQLite"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.cursor()
+                
+                # Check if user exists
+                await cursor.execute(
+                    "SELECT user_id FROM users WHERE user_id = ?",
+                    (user_id,)
+                )
+                exists = await cursor.fetchone()
+                
+                if exists:
+                    # Update existing user
+                    await cursor.execute("""
+                        UPDATE users SET 
+                        username = ?, first_name = ?, last_name = ?,
+                        language_code = ?, last_seen = CURRENT_TIMESTAMP
+                        WHERE user_id = ?
+                    """, (
+                        data.get('username'),
+                        data.get('first_name'),
+                        data.get('last_name'),
+                        data.get('language_code'),
+                        user_id
+                    ))
+                else:
+                    # Insert new user
+                    await cursor.execute("""
+                        INSERT INTO users 
+                        (user_id, username, first_name, last_name, language_code, balance)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (
+                        user_id,
+                        data.get('username'),
+                        data.get('first_name'),
+                        data.get('last_name'),
+                        data.get('language_code'),
+                        data.get('balance', 1000)
+                    ))
+                
+                await db.commit()
+                
+                # Cache locally
+                if 'users' not in self.local_data:
+                    self.local_data['users'] = {}
+                self.local_data['users'][str(user_id)] = data
+                self._save_local_data()
+                
+                return True
+                
+        except Exception as e:
+            print(f"Error saving user {user_id}: {e}")
+            return False
     
     async def get_user(self, user_id: int) -> Optional[Dict]:
         """Get user data"""
@@ -70,77 +107,116 @@ class Database:
         if 'users' in self.local_data and str(user_id) in self.local_data['users']:
             return self.local_data['users'][str(user_id)]
         
-        # Fetch from Firebase
         try:
-            user_ref = self.db.collection('users').document(str(user_id))
-            doc = user_ref.get()
-            
-            if doc.exists:
-                user_data = doc.to_dict()
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = sqlite3.Row
+                cursor = await db.cursor()
                 
-                # Cache locally
-                if 'users' not in self.local_data:
-                    self.local_data['users'] = {}
-                self.local_data['users'][str(user_id)] = user_data
-                self._save_local_data()
+                await cursor.execute(
+                    "SELECT * FROM users WHERE user_id = ?",
+                    (user_id,)
+                )
+                row = await cursor.fetchone()
                 
-                return user_data
+                if row:
+                    user_data = dict(row)
+                    
+                    # Cache locally
+                    if 'users' not in self.local_data:
+                        self.local_data['users'] = {}
+                    self.local_data['users'][str(user_id)] = user_data
+                    self._save_local_data()
+                    
+                    return user_data
+                    
         except Exception as e:
             print(f"Error fetching user {user_id}: {e}")
         
         return None
     
-    async def update_user_balance(self, user_id: int, amount: int, reason: str = ""):
+    async def update_user_balance(self, user_id: int, amount: int, reason: str = "") -> int:
         """Update user balance"""
-        user_data = await self.get_user(user_id) or {}
-        current_balance = user_data.get('balance', 1000)
-        new_balance = current_balance + amount
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.cursor()
+                
+                # Get current balance
+                await cursor.execute(
+                    "SELECT balance FROM users WHERE user_id = ?",
+                    (user_id,)
+                )
+                result = await cursor.fetchone()
+                
+                if result:
+                    current_balance = result[0]
+                    new_balance = current_balance + amount
+                    
+                    # Update balance
+                    await cursor.execute(
+                        "UPDATE users SET balance = ? WHERE user_id = ?",
+                        (new_balance, user_id)
+                    )
+                    
+                    # Add transaction
+                    await cursor.execute("""
+                        INSERT INTO transactions 
+                        (user_id, amount, type, reason, balance_after)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        user_id,
+                        amount,
+                        'credit' if amount > 0 else 'debit',
+                        reason,
+                        new_balance
+                    ))
+                    
+                    await db.commit()
+                    
+                    # Update local cache
+                    if 'users' in self.local_data and str(user_id) in self.local_data['users']:
+                        self.local_data['users'][str(user_id)]['balance'] = new_balance
+                        self._save_local_data()
+                    
+                    return new_balance
+                    
+        except Exception as e:
+            print(f"Error updating balance for {user_id}: {e}")
         
-        # Update user data
-        user_data['balance'] = new_balance
-        
-        # Add transaction
-        if 'transactions' not in user_data:
-            user_data['transactions'] = []
-        
-        user_data['transactions'].append({
-            'amount': amount,
-            'type': 'credit' if amount > 0 else 'debit',
-            'reason': reason,
-            'timestamp': datetime.now().isoformat(),
-            'balance_after': new_balance
-        })
-        
-        # Keep only last 100 transactions
-        if len(user_data['transactions']) > 100:
-            user_data['transactions'] = user_data['transactions'][-100:]
-        
-        # Save updated data
-        await self.save_user(user_id, user_data)
-        
-        return new_balance
+        return 0
     
     # ==================== GROUP OPERATIONS ====================
     
-    async def save_group(self, group_id: int, data: Dict):
+    async def save_group(self, group_id: int, data: Dict) -> bool:
         """Save group data"""
-        group_ref = self.db.collection('groups').document(str(group_id))
-        
-        group_data = {
-            **data,
-            'updated_at': firestore.SERVER_TIMESTAMP
-        }
-        
-        group_ref.set(group_data, merge=True)
-        
-        # Cache locally
-        if 'groups' not in self.local_data:
-            self.local_data['groups'] = {}
-        
-        self.local_data['groups'][str(group_id)] = group_data
-        self._save_local_data()
-        
-        return True
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.cursor()
+                
+                await cursor.execute("""
+                    INSERT OR REPLACE INTO groups 
+                    (group_id, title, username, welcome_message, rules)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    group_id,
+                    data.get('title'),
+                    data.get('username'),
+                    data.get('welcome_message', ''),
+                    data.get('rules', '')
+                ))
+                
+                await db.commit()
+                
+                # Cache locally
+                if 'groups' not in self.local_data:
+                    self.local_data['groups'] = {}
+                self.local_data['groups'][str(group_id)] = data
+                self._save_local_data()
+                
+                return True
+                
+        except Exception as e:
+            print(f"Error saving group {group_id}: {e}")
+            return False
     
     async def get_group(self, group_id: int) -> Optional[Dict]:
         """Get group data"""
@@ -148,18 +224,26 @@ class Database:
             return self.local_data['groups'][str(group_id)]
         
         try:
-            group_ref = self.db.collection('groups').document(str(group_id))
-            doc = group_ref.get()
-            
-            if doc.exists:
-                group_data = doc.to_dict()
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = sqlite3.Row
+                cursor = await db.cursor()
                 
-                if 'groups' not in self.local_data:
-                    self.local_data['groups'] = {}
-                self.local_data['groups'][str(group_id)] = group_data
-                self._save_local_data()
+                await cursor.execute(
+                    "SELECT * FROM groups WHERE group_id = ?",
+                    (group_id,)
+                )
+                row = await cursor.fetchone()
                 
-                return group_data
+                if row:
+                    group_data = dict(row)
+                    
+                    if 'groups' not in self.local_data:
+                        self.local_data['groups'] = {}
+                    self.local_data['groups'][str(group_id)] = group_data
+                    self._save_local_data()
+                    
+                    return group_data
+                    
         except Exception as e:
             print(f"Error fetching group {group_id}: {e}")
         
@@ -167,123 +251,158 @@ class Database:
     
     # ==================== MESSAGE OPERATIONS ====================
     
-    async def save_message(self, user_id: int, chat_id: int, text: str):
+    async def save_message(self, user_id: int, chat_id: int, text: str) -> bool:
         """Save message for analytics"""
-        message_data = {
-            'user_id': user_id,
-            'chat_id': chat_id,
-            'text': text[:1000],  # Limit text length
-            'timestamp': firestore.SERVER_TIMESTAMP,
-            'length': len(text)
-        }
-        
-        # Save to Firebase
-        messages_ref = self.db.collection('messages')
-        messages_ref.add(message_data)
-        
-        # Update statistics
-        await self.update_statistics('messages_processed')
-        
-        return True
-    
-    async def update_statistics(self, stat_name: str, increment: int = 1):
-        """Update bot statistics"""
-        stats_ref = self.db.collection('statistics').document('bot_stats')
-        
         try:
-            stats_ref.set({
-                stat_name: firestore.Increment(increment),
-                'updated_at': firestore.SERVER_TIMESTAMP
-            }, merge=True)
-        except:
-            pass
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.cursor()
+                
+                await cursor.execute("""
+                    INSERT INTO messages 
+                    (user_id, chat_id, text, length)
+                    VALUES (?, ?, ?, ?)
+                """, (
+                    user_id,
+                    chat_id,
+                    text[:1000],  # Limit text length
+                    len(text)
+                ))
+                
+                await db.commit()
+                return True
+                
+        except Exception as e:
+            print(f"Error saving message: {e}")
+            return False
     
     # ==================== GAME OPERATIONS ====================
     
-    async def save_game_result(self, game_id: str, game_data: Dict):
+    async def save_game_result(self, game_id: str, game_data: Dict) -> bool:
         """Save game result"""
-        games_ref = self.db.collection('games').document(game_id)
-        
-        game_data['ended_at'] = firestore.SERVER_TIMESTAMP
-        games_ref.set(game_data, merge=True)
-        
-        return True
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.cursor()
+                
+                await cursor.execute("""
+                    INSERT INTO games 
+                    (game_id, game_type, player_id, status, data)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (
+                    game_id,
+                    game_data.get('type'),
+                    game_data.get('player'),
+                    game_data.get('status', 'finished'),
+                    json.dumps(game_data)
+                ))
+                
+                await db.commit()
+                return True
+                
+        except Exception as e:
+            print(f"Error saving game {game_id}: {e}")
+            return False
     
     async def get_user_games(self, user_id: int, limit: int = 10) -> List[Dict]:
         """Get user's recent games"""
         try:
-            games_ref = self.db.collection('games')
-            query = games_ref.where('players', 'array_contains', user_id)\
-                            .order_by('ended_at', direction=firestore.Query.DESCENDING)\
-                            .limit(limit)
-            
-            docs = query.get()
-            games = [doc.to_dict() for doc in docs]
-            return games
-        except:
+            async with aiosqlite.connect(self.db_path) as db:
+                db.row_factory = sqlite3.Row
+                cursor = await db.cursor()
+                
+                await cursor.execute("""
+                    SELECT * FROM games 
+                    WHERE player_id = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                """, (user_id, limit))
+                
+                rows = await cursor.fetchall()
+                games = []
+                
+                for row in rows:
+                    game = dict(row)
+                    try:
+                        game['data'] = json.loads(game['data'])
+                    except:
+                        game['data'] = {}
+                    games.append(game)
+                
+                return games
+                
+        except Exception as e:
+            print(f"Error fetching games for {user_id}: {e}")
             return []
     
-    # ==================== LEARNING OPERATIONS ====================
+    # ==================== WARNING OPERATIONS ====================
     
-    async def save_learning(self, question: str, answer: str, user_id: int):
-        """Save learning data"""
-        learning_data = {
-            'question': question,
-            'answer': answer,
-            'user_id': user_id,
-            'timestamp': firestore.SERVER_TIMESTAMP,
-            'source': 'user_teaching'
-        }
-        
-        learnings_ref = self.db.collection('learnings')
-        learnings_ref.add(learning_data)
-        
-        return True
+    async def add_warning(self, user_id: int, chat_id: int, reason: str, admin_id: int) -> int:
+        """Add warning to user"""
+        try:
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.cursor()
+                
+                # Add warning
+                await cursor.execute("""
+                    INSERT INTO warnings 
+                    (user_id, chat_id, reason, admin_id)
+                    VALUES (?, ?, ?, ?)
+                """, (user_id, chat_id, reason, admin_id))
+                
+                # Count total warnings
+                await cursor.execute(
+                    "SELECT COUNT(*) FROM warnings WHERE user_id = ?",
+                    (user_id,)
+                )
+                result = await cursor.fetchone()
+                total_warnings = result[0] if result else 0
+                
+                await db.commit()
+                
+                # Update user warnings count
+                await cursor.execute(
+                    "UPDATE users SET warnings = ? WHERE user_id = ?",
+                    (total_warnings, user_id)
+                )
+                
+                await db.commit()
+                return total_warnings
+                
+        except Exception as e:
+            print(f"Error adding warning for {user_id}: {e}")
+            return 0
     
     # ==================== BACKUP OPERATIONS ====================
     
-    async def create_backup(self):
+    async def create_backup(self) -> str:
         """Create database backup"""
         try:
-            backup_data = {
-                'timestamp': datetime.now().isoformat(),
-                'users_count': 0,
-                'groups_count': 0,
-                'messages_count': 0
-            }
+            backup_dir = "backups"
+            os.makedirs(backup_dir, exist_ok=True)
             
-            # Count users
-            users_ref = self.db.collection('users')
-            users_docs = users_ref.get()
-            backup_data['users_count'] = len(users_docs)
+            backup_file = f"{backup_dir}/backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.db"
             
-            # Count groups
-            groups_ref = self.db.collection('groups')
-            groups_docs = groups_ref.get()
-            backup_data['groups_count'] = len(groups_docs)
-            
-            # Save backup
-            backup_file = f"{self.backup_path}backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            with open(backup_file, 'w', encoding='utf-8') as f:
-                json.dump(backup_data, f, ensure_ascii=False, indent=2)
+            # Simple file copy for SQLite
+            import shutil
+            shutil.copy2(self.db_path, backup_file)
             
             print(f"✅ Backup created: {backup_file}")
             return backup_file
             
         except Exception as e:
             print(f"❌ Backup failed: {e}")
-            return None
+            return ""
     
     async def cleanup_old_backups(self, keep_last: int = 7):
         """Cleanup old backups"""
         try:
-            if not os.path.exists(self.backup_path):
+            backup_dir = "backups"
+            if not os.path.exists(backup_dir):
                 return
             
             backup_files = []
-            for file in os.listdir(self.backup_path):
-                if file.startswith('backup_') and file.endswith('.json'):
-                    file_path = os.path.join(self.backup_path, file)
+            for file in os.listdir(backup_dir):
+                if file.startswith('backup_') and file.endswith('.db'):
+                    file_path = os.path.join(backup_dir, file)
                     backup_files.append((file_path, os.path.getmtime(file_path)))
             
             # Sort by modification time (oldest first)
@@ -296,3 +415,54 @@ class Database:
                 
         except Exception as e:
             print(f"❌ Cleanup failed: {e}")
+    
+    # ==================== STATISTICS ====================
+    
+    async def get_statistics(self) -> Dict:
+        """Get database statistics"""
+        stats = {
+            'users': 0,
+            'groups': 0,
+            'messages': 0,
+            'games': 0,
+            'warnings': 0,
+            'database_size': 0
+        }
+        
+        try:
+            # Get file size
+            if os.path.exists(self.db_path):
+                stats['database_size'] = os.path.getsize(self.db_path)
+            
+            async with aiosqlite.connect(self.db_path) as db:
+                cursor = await db.cursor()
+                
+                # Count users
+                await cursor.execute("SELECT COUNT(*) FROM users")
+                result = await cursor.fetchone()
+                stats['users'] = result[0] if result else 0
+                
+                # Count groups
+                await cursor.execute("SELECT COUNT(*) FROM groups")
+                result = await cursor.fetchone()
+                stats['groups'] = result[0] if result else 0
+                
+                # Count messages
+                await cursor.execute("SELECT COUNT(*) FROM messages")
+                result = await cursor.fetchone()
+                stats['messages'] = result[0] if result else 0
+                
+                # Count games
+                await cursor.execute("SELECT COUNT(*) FROM games")
+                result = await cursor.fetchone()
+                stats['games'] = result[0] if result else 0
+                
+                # Count warnings
+                await cursor.execute("SELECT COUNT(*) FROM warnings")
+                result = await cursor.fetchone()
+                stats['warnings'] = result[0] if result else 0
+                
+        except Exception as e:
+            print(f"Error getting statistics: {e}")
+        
+        return stats
