@@ -1,0 +1,7 @@
+# .gitignore ফাইলে যোগ করুন
+firebase-key.json
+.env
+*.pkl
+data/
+logs/
+backups/
